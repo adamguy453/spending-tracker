@@ -1,41 +1,52 @@
-import { useEffect, useMemo, useState } from "react";
-
-type Category =
-  | "Fun"
-  | "Bill"
-  | "Subscription"
-  | "Hygiene"
-  | "Gas"
-  | "Car"
-  | "Supplements"
-  | "Beer"
-  | "Food"
-  | "Other";
+import React, { useEffect, useMemo, useState } from "react";
 
 type Entry = {
   id: string;
-  month: string; // YYYY-MM
   date: string; // YYYY-MM-DD
   amount: number;
-  category: Category;
-  location: string;
+  category: string;
   what: string;
 };
 
-const CATEGORIES: Category[] = [
+const DEFAULT_CATEGORIES = [
   "Fun",
-  "Bill",
-  "Subscription",
+  "Bills",
+  "Subscriptions",
   "Hygiene",
   "Gas",
   "Car",
   "Supplements",
-  "Beer",
   "Food",
   "Other",
 ];
 
-const STORAGE_KEY = "spend-tracker.v1";
+const STORAGE = {
+  categories: "spendTracker:categories",
+  entries: (monthKey: string) => `spendTracker:entries:${monthKey}`,
+  budgets: (monthKey: string) => `spendTracker:budgets:${monthKey}`,
+};
+
+function money(n: number) {
+  return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function safeJsonParse<T>(raw: string | null, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function monthKeyFromMonthInput(monthValue: string) {
+  // monthValue like "2026-01"
+  return monthValue;
+}
 
 function todayISO() {
   const d = new Date();
@@ -45,618 +56,731 @@ function todayISO() {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-function monthFromDate(dateISO: string) {
-  return dateISO.slice(0, 7);
-}
-
-function formatMoney(n: number) {
-  return `$${n.toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
-
-function monthLabel(month: string) {
-  // month = YYYY-MM
-  const [y, m] = month.split("-").map(Number);
-  const d = new Date(y, m - 1, 1);
-  return d.toLocaleString(undefined, { month: "long", year: "numeric" });
-}
-
-function safeParse<T>(raw: string | null, fallback: T): T {
-  try {
-    if (!raw) return fallback;
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
-  }
+function thisMonthISO() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  return `${yyyy}-${mm}`;
 }
 
 export default function App() {
-  // --- DATA ---
-  const [allEntries, setAllEntries] = useState<Entry[]>(() =>
-    safeParse<Entry[]>(localStorage.getItem(STORAGE_KEY), [])
-  );
+  // Month selection
+  const [monthValue, setMonthValue] = useState<string>(thisMonthISO());
+  const monthKey = monthKeyFromMonthInput(monthValue);
 
-  // Default month = current month
-  const [month, setMonth] = useState<string>(() => monthFromDate(todayISO()));
+  // Categories (global, not per-month)
+  const [categories, setCategories] = useState<string[]>(() => {
+    const saved = safeJsonParse<string[]>(
+      localStorage.getItem(STORAGE.categories),
+      []
+    );
+    const normalized = saved
+      .map((s) => (typeof s === "string" ? s.trim() : ""))
+      .filter(Boolean);
 
-  // --- ADD FORM ---
-  const [date, setDate] = useState<string>(todayISO());
-  const [amount, setAmount] = useState<string>("");
-  const [category, setCategory] = useState<Category>("Fun");
-  const [location, setLocation] = useState<string>("");
-  const [what, setWhat] = useState<string>("");
+    return normalized.length ? normalized : DEFAULT_CATEGORIES;
+  });
 
-  // --- EDIT STATE ---
+  // Budgets (per month)
+  const [budgets, setBudgets] = useState<Record<string, number>>({});
+
+  // Entries (per month)
+  const [entries, setEntries] = useState<Entry[]>([]);
+
+  // UI state
+  const [isEditingBudgets, setIsEditingBudgets] = useState(false);
+  const [isManagingCategories, setIsManagingCategories] = useState(false);
+
+  // Add category input
+  const [newCategory, setNewCategory] = useState("");
+
+  // Add/Edit expense form
+  const [formDate, setFormDate] = useState(todayISO());
+  const [formAmount, setFormAmount] = useState<string>("");
+  const [formCategory, setFormCategory] = useState<string>(() => {
+    return DEFAULT_CATEGORIES[0];
+  });
+  const [formWhat, setFormWhat] = useState<string>("");
+
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editDraft, setEditDraft] = useState<Entry | null>(null);
 
-  // Persist to localStorage whenever entries change
+  // --- Load categories -> ensure current selected category exists
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(allEntries));
-  }, [allEntries]);
-
-  // Keep add form date in the selected month (nice UX)
-  useEffect(() => {
-    const formMonth = monthFromDate(date);
-    if (formMonth !== month) {
-      // set date to first day of selected month
-      setDate(`${month}-01`);
+    localStorage.setItem(STORAGE.categories, JSON.stringify(categories));
+    // If current selected category got removed, fall back to first
+    if (!categories.includes(formCategory)) {
+      setFormCategory(categories[0] ?? "Other");
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [month]);
+  }, [categories]);
 
-  const monthEntries = useMemo(() => {
-    return allEntries
-      .filter((e) => e.month === month)
-      .sort((a, b) => b.date.localeCompare(a.date));
-  }, [allEntries, month]);
+  // --- Load entries + budgets for the selected month
+  useEffect(() => {
+    const loadedEntries = safeJsonParse<Entry[]>(
+      localStorage.getItem(STORAGE.entries(monthKey)),
+      []
+    ).filter(
+      (e) =>
+        e &&
+        typeof e.id === "string" &&
+        typeof e.date === "string" &&
+        typeof e.amount === "number" &&
+        typeof e.category === "string" &&
+        typeof e.what === "string"
+    );
+
+    const loadedBudgets = safeJsonParse<Record<string, number>>(
+      localStorage.getItem(STORAGE.budgets(monthKey)),
+      {}
+    );
+
+    setEntries(loadedEntries);
+
+    // Make sure budgets has numeric values only
+    const cleaned: Record<string, number> = {};
+    for (const [k, v] of Object.entries(loadedBudgets)) {
+      cleaned[k] = typeof v === "number" && isFinite(v) ? v : 0;
+    }
+    setBudgets(cleaned);
+
+    // Reset edit state when switching months
+    setEditingId(null);
+    setFormAmount("");
+    setFormWhat("");
+    setFormDate(todayISO());
+  }, [monthKey]);
+
+  // --- Persist entries + budgets
+  useEffect(() => {
+    localStorage.setItem(STORAGE.entries(monthKey), JSON.stringify(entries));
+  }, [entries, monthKey]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE.budgets(monthKey), JSON.stringify(budgets));
+  }, [budgets, monthKey]);
+
+  // --- Derived stats
+  const categoryTotals = useMemo(() => {
+    const totals: Record<string, number> = {};
+    for (const e of entries) {
+      totals[e.category] = (totals[e.category] ?? 0) + e.amount;
+    }
+    return totals;
+  }, [entries]);
 
   const monthTotal = useMemo(() => {
-    return monthEntries.reduce((sum, e) => sum + e.amount, 0);
-  }, [monthEntries]);
+    return entries.reduce((sum, e) => sum + e.amount, 0);
+  }, [entries]);
 
-  const categoryTotals = useMemo(() => {
-    const map: Record<Category, number> = Object.fromEntries(
-      CATEGORIES.map((c) => [c, 0])
-    ) as Record<Category, number>;
-
-    for (const e of monthEntries) map[e.category] += e.amount;
-    return map;
-  }, [monthEntries]);
+  const entriesCount = entries.length;
 
   const biggestCategory = useMemo(() => {
-    let best: Category | null = null;
+    let bestCat = "—";
     let bestVal = 0;
-    for (const c of CATEGORIES) {
-      const v = categoryTotals[c];
-      if (v > bestVal) {
-        bestVal = v;
-        best = c;
+    for (const [cat, total] of Object.entries(categoryTotals)) {
+      if (total > bestVal) {
+        bestVal = total;
+        bestCat = cat;
       }
     }
-    return best ? `${best} (${formatMoney(bestVal)})` : "—";
+    if (bestVal <= 0) return "—";
+    return `${bestCat} (${money(bestVal)})`;
   }, [categoryTotals]);
 
-  function addExpense() {
-    const amt = Number(amount);
-    if (!Number.isFinite(amt) || amt <= 0) return;
-    if (!what.trim()) return;
-
-    const entry: Entry = {
-      id: crypto.randomUUID(),
-      month,
-      date,
-      amount: amt,
-      category,
-      location: location.trim(),
-      what: what.trim(),
-    };
-
-    setAllEntries((prev) => [entry, ...prev]);
-
-    // Reset inputs but keep month/date sensible
-    setAmount("");
-    setCategory("Fun");
-    setLocation("");
-    setWhat("");
+  // --- Actions
+  function clearMonth() {
+    if (!confirm(`Clear all entries + budgets for ${monthKey}?`)) return;
+    setEntries([]);
+    setBudgets({});
+    localStorage.removeItem(STORAGE.entries(monthKey));
+    localStorage.removeItem(STORAGE.budgets(monthKey));
   }
 
-  function deleteEntry(id: string) {
-    setAllEntries((prev) => prev.filter((e) => e.id !== id));
-    if (editingId === id) {
-      setEditingId(null);
-      setEditDraft(null);
+  function clearAll() {
+    if (
+      !confirm(
+        "Clear EVERYTHING? (All months, all entries, all budgets, all categories reset to default.)"
+      )
+    )
+      return;
+
+    // brute force remove known keys
+    // (keeps it simple, since we don't track all month keys separately)
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i);
+      if (!key) continue;
+      if (key.startsWith("spendTracker:")) localStorage.removeItem(key);
     }
+
+    setCategories(DEFAULT_CATEGORIES);
+    setEntries([]);
+    setBudgets({});
+    setMonthValue(thisMonthISO());
+    setEditingId(null);
+    setFormAmount("");
+    setFormWhat("");
+    setFormDate(todayISO());
+  }
+
+  function addOrUpdateExpense() {
+    const amount = Number(formAmount);
+    if (!isFinite(amount) || amount <= 0) {
+      alert("Amount must be greater than 0.");
+      return;
+    }
+    if (!formWhat.trim()) {
+      alert('"What was it?" can’t be empty.');
+      return;
+    }
+    if (!formCategory.trim()) {
+      alert("Category is required.");
+      return;
+    }
+    if (!formDate) {
+      alert("Date is required.");
+      return;
+    }
+
+    // If user removed the category but an old entry is being edited,
+    // we still allow it; but for new entries we strongly prefer existing categories.
+    if (!categories.includes(formCategory)) {
+      const ok = confirm(
+        `"${formCategory}" is not in your category list. Add it as a new category?`
+      );
+      if (ok) {
+        setCategories((prev) => [...prev, formCategory].sort());
+      } else {
+        alert("Pick an existing category.");
+        return;
+      }
+    }
+
+    if (editingId) {
+      setEntries((prev) =>
+        prev.map((e) =>
+          e.id === editingId
+            ? {
+                ...e,
+                date: formDate,
+                amount,
+                category: formCategory,
+                what: formWhat.trim(),
+              }
+            : e
+        )
+      );
+      setEditingId(null);
+    } else {
+      const entry: Entry = {
+        id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
+        date: formDate,
+        amount,
+        category: formCategory,
+        what: formWhat.trim(),
+      };
+      setEntries((prev) => [entry, ...prev].sort((a, b) => (a.date < b.date ? 1 : -1)));
+    }
+
+    setFormAmount("");
+    setFormWhat("");
+    // keep date and category
   }
 
   function startEdit(e: Entry) {
     setEditingId(e.id);
-    setEditDraft({ ...e });
+    setFormDate(e.date);
+    setFormAmount(String(e.amount));
+    setFormCategory(e.category);
+    setFormWhat(e.what);
+    // scroll to form area (nice UX)
+    setTimeout(() => window.scrollTo({ top: 0, behavior: "smooth" }), 50);
   }
 
   function cancelEdit() {
     setEditingId(null);
-    setEditDraft(null);
+    setFormAmount("");
+    setFormWhat("");
+    setFormDate(todayISO());
+    // keep category
   }
 
-  function saveEdit() {
-    if (!editDraft || !editingId) return;
-
-    const amt = Number(editDraft.amount);
-    if (!Number.isFinite(amt) || amt <= 0) return;
-    if (!editDraft.what.trim()) return;
-
-    // Keep month consistent with selected month (we’re editing within a month view)
-    const updated: Entry = {
-      ...editDraft,
-      month,
-      date: editDraft.date.slice(0, 10),
-      amount: amt,
-      location: editDraft.location.trim(),
-      what: editDraft.what.trim(),
-    };
-
-    setAllEntries((prev) => prev.map((x) => (x.id === editingId ? updated : x)));
-    setEditingId(null);
-    setEditDraft(null);
+  function deleteEntry(id: string) {
+    if (!confirm("Delete this entry?")) return;
+    setEntries((prev) => prev.filter((e) => e.id !== id));
   }
 
-  function clearMonth() {
-    setAllEntries((prev) => prev.filter((e) => e.month !== month));
-    setEditingId(null);
-    setEditDraft(null);
+  function addCategory() {
+    const name = newCategory.trim();
+    if (!name) return;
+
+    // prevent duplicates ignoring case
+    const exists = categories.some((c) => c.toLowerCase() === name.toLowerCase());
+    if (exists) {
+      alert("That category already exists.");
+      return;
+    }
+
+    setCategories((prev) => [...prev, name].sort());
+    setNewCategory("");
   }
 
-  function clearAll() {
-    setAllEntries([]);
-    setEditingId(null);
-    setEditDraft(null);
+  function removeCategory(name: string) {
+    const used = entries.some((e) => e.category === name);
+    const msg = used
+      ? `"${name}" is used by existing entries. Removing it will NOT delete those entries, but it will disappear from your dropdown. Continue?`
+      : `Remove category "${name}"?`;
+
+    if (!confirm(msg)) return;
+
+    setCategories((prev) => prev.filter((c) => c !== name));
+    setBudgets((prev) => {
+      const next = { ...prev };
+      delete next[name];
+      return next;
+    });
+
+    if (formCategory === name) {
+      setFormCategory(categories.find((c) => c !== name) ?? "Other");
+    }
   }
+
+  function setBudget(cat: string, value: string) {
+    const n = Number(value);
+    setBudgets((prev) => ({
+      ...prev,
+      [cat]: isFinite(n) && n >= 0 ? n : 0,
+    }));
+  }
+
+  // --- UI bits
+  const containerStyle: React.CSSProperties = {
+    maxWidth: 1100,
+    margin: "0 auto",
+    padding: "28px 18px 60px",
+    color: "rgba(255,255,255,0.92)",
+    fontFamily:
+      'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif',
+  };
+
+  const panelStyle: React.CSSProperties = {
+    background: "rgba(255,255,255,0.06)",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: 14,
+    padding: 16,
+    boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
+  };
+
+  const buttonStyle: React.CSSProperties = {
+    padding: "10px 12px",
+    borderRadius: 10,
+    border: "1px solid rgba(255,255,255,0.18)",
+    background: "rgba(255,255,255,0.08)",
+    color: "rgba(255,255,255,0.92)",
+    cursor: "pointer",
+    fontWeight: 600,
+  };
+
+  const dangerButtonStyle: React.CSSProperties = {
+    ...buttonStyle,
+    border: "1px solid rgba(255,90,90,0.55)",
+    background: "rgba(255,90,90,0.12)",
+  };
+
+  const primaryButtonStyle: React.CSSProperties = {
+    ...buttonStyle,
+    border: "1px solid rgba(90,180,255,0.65)",
+    background: "rgba(90,180,255,0.18)",
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: "100%",
+    padding: "10px 10px",
+    borderRadius: 10,
+    border: "1px solid rgba(255,255,255,0.14)",
+    background: "rgba(0,0,0,0.25)",
+    color: "rgba(255,255,255,0.92)",
+    outline: "none",
+  };
+
+  const labelStyle: React.CSSProperties = { display: "grid", gap: 6 };
 
   return (
-    <div style={styles.page}>
-      <div style={styles.headerRow}>
-        <div>
-          <h1 style={styles.title}>Spending Tracker</h1>
-          <div style={styles.subtitle}>Stored locally in your browser (no bank syncing).</div>
-        </div>
-        <button style={{ ...styles.btn, ...styles.btnDangerOutline }} onClick={clearAll}>
-          Clear All
-        </button>
-      </div>
-
-      {/* Month */}
-      <div style={styles.panel}>
-        <div style={styles.panelHeaderRow}>
+    <div
+      style={{
+        minHeight: "100vh",
+        background:
+          "radial-gradient(1200px 600px at 20% 0%, rgba(90,180,255,0.18), transparent 60%), radial-gradient(900px 500px at 80% 20%, rgba(255,90,90,0.12), transparent 60%), #0b1220",
+      }}
+    >
+      <div style={containerStyle}>
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
           <div>
-            <div style={styles.sectionLabel}>Month</div>
-            <div style={styles.monthRow}>
-              <input
-                type="month"
-                value={month}
-                onChange={(e) => setMonth(e.target.value)}
-                style={styles.input}
-              />
-              <div style={{ opacity: 0.85 }}>{monthLabel(month)}</div>
-            </div>
+            <h1 style={{ margin: 0, fontSize: 42, letterSpacing: -0.6 }}>Spending Tracker</h1>
+            <p style={{ marginTop: 6, opacity: 0.8 }}>
+              Stored locally in your browser (no bank syncing).
+            </p>
           </div>
 
-          <button style={{ ...styles.btn, ...styles.btnOutline }} onClick={clearMonth}>
-            Clear Month
+          <button style={dangerButtonStyle} onClick={clearAll}>
+            Clear All
           </button>
         </div>
 
-        {/* Summary cards */}
-        <div style={styles.cards}>
-          <MiniCard title="Month Total" value={formatMoney(monthTotal)} />
-          <MiniCard title="Biggest Category" value={biggestCategory} />
-          <MiniCard title="Entries" value={String(monthEntries.length)} />
-          <MiniCard title="Month" value={month} />
-        </div>
+        {/* Top panel */}
+        <div style={{ ...panelStyle, marginTop: 18 }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr auto",
+              gap: 14,
+              alignItems: "start",
+            }}
+          >
+            <div style={{ display: "grid", gap: 10 }}>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <div style={{ display: "grid", gap: 6 }}>
+                  <div style={{ opacity: 0.85, fontWeight: 700 }}>Month</div>
+                  <input
+                    type="month"
+                    value={monthValue}
+                    onChange={(e) => setMonthValue(e.target.value)}
+                    style={{ ...inputStyle, width: 200 }}
+                  />
+                </div>
 
-        {/* Category totals */}
-        <div style={{ marginTop: 14 }}>
-          <div style={styles.sectionLabel}>Category Totals</div>
-          <div style={styles.categoryGrid}>
-            {CATEGORIES.map((c) => (
-              <div key={c} style={styles.categoryPill}>
-                <div style={{ fontWeight: 700 }}>{c}</div>
-                <div style={{ fontVariantNumeric: "tabular-nums" }}>
-                  {formatMoney(categoryTotals[c])}
+                <div style={{ opacity: 0.9, fontWeight: 700, paddingTop: 22 }}>{monthKey}</div>
+              </div>
+
+              {/* Stats cards */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                  gap: 12,
+                }}
+              >
+                <div style={panelStyle}>
+                  <div style={{ opacity: 0.8, fontWeight: 700 }}>Month Total</div>
+                  <div style={{ fontSize: 24, fontWeight: 900, marginTop: 6 }}>{money(monthTotal)}</div>
+                </div>
+
+                <div style={panelStyle}>
+                  <div style={{ opacity: 0.8, fontWeight: 700 }}>Biggest Category</div>
+                  <div style={{ fontSize: 18, fontWeight: 900, marginTop: 8 }}>{biggestCategory}</div>
+                </div>
+
+                <div style={panelStyle}>
+                  <div style={{ opacity: 0.8, fontWeight: 700 }}>Entries</div>
+                  <div style={{ fontSize: 24, fontWeight: 900, marginTop: 6 }}>{entriesCount}</div>
                 </div>
               </div>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      {/* Add Expense */}
-      <div style={styles.panel}>
-        <div style={styles.sectionTitle}>Add Expense</div>
-
-        <div style={styles.addGrid}>
-          <Field label="Date">
-            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={styles.input} />
-          </Field>
-
-          <Field label="Amount">
-            <input
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              placeholder="12.34"
-              inputMode="decimal"
-              style={styles.input}
-            />
-          </Field>
-
-          <Field label="Category">
-            <select value={category} onChange={(e) => setCategory(e.target.value as Category)} style={styles.input}>
-              {CATEGORIES.map((c) => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-          </Field>
-
-          <Field label="Location">
-            <input
-              value={location}
-              onChange={(e) => setLocation(e.target.value)}
-              placeholder="Costco, Shell, Amazon…"
-              style={styles.input}
-            />
-          </Field>
-
-          <Field label="What was it?" full>
-            <input
-              value={what}
-              onChange={(e) => setWhat(e.target.value)}
-              placeholder="Groceries, protein powder, car wash…"
-              style={styles.input}
-            />
-          </Field>
-
-          <div style={styles.addActionsRow}>
-            <div style={styles.tip}>
-              Tip: Amount must be {">"} 0 and “What was it?” can’t be empty.
             </div>
-            <button style={{ ...styles.btn, ...styles.btnPrimary }} onClick={addExpense}>
-              Add
-            </button>
+
+            <div style={{ display: "grid", gap: 10 }}>
+              <button style={dangerButtonStyle} onClick={clearMonth}>
+                Clear Month
+              </button>
+
+              <button
+                style={buttonStyle}
+                onClick={() => setIsManagingCategories((v) => !v)}
+              >
+                {isManagingCategories ? "Done" : "Manage Categories"}
+              </button>
+
+              <button
+                style={buttonStyle}
+                onClick={() => setIsEditingBudgets((v) => !v)}
+              >
+                {isEditingBudgets ? "Done" : "Edit Budgets"}
+              </button>
+            </div>
+          </div>
+
+          {/* Manage categories */}
+          {isManagingCategories && (
+            <div style={{ ...panelStyle, marginTop: 14 }}>
+              <h3 style={{ marginTop: 0 }}>Categories</h3>
+
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "end" }}>
+                <div style={{ ...labelStyle, minWidth: 260 }}>
+                  <span style={{ opacity: 0.85, fontWeight: 700 }}>Add a category</span>
+                  <input
+                    style={inputStyle}
+                    value={newCategory}
+                    onChange={(e) => setNewCategory(e.target.value)}
+                    placeholder="e.g., Pets, Travel, Medical..."
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") addCategory();
+                    }}
+                  />
+                </div>
+
+                <button style={primaryButtonStyle} onClick={addCategory}>
+                  Add Category
+                </button>
+              </div>
+
+              <div
+                style={{
+                  marginTop: 14,
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                  gap: 10,
+                }}
+              >
+                {categories.map((cat) => (
+                  <div key={cat} style={{ ...panelStyle, padding: 12, display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                    <div style={{ fontWeight: 800 }}>{cat}</div>
+                    <button style={dangerButtonStyle} onClick={() => removeCategory(cat)}>
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              <p style={{ marginTop: 12, opacity: 0.75 }}>
+                Removing a category does <b>not</b> delete old entries that used it.
+              </p>
+            </div>
+          )}
+
+          {/* Category totals + budgets */}
+          <div style={{ marginTop: 14 }}>
+            <h3 style={{ margin: "6px 0 10px" }}>Category Totals</h3>
+
+            {isEditingBudgets && (
+              <div style={{ ...panelStyle, marginBottom: 12 }}>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                    gap: 10,
+                  }}
+                >
+                  {categories.map((cat) => (
+                    <label key={cat} style={labelStyle}>
+                      <span style={{ opacity: 0.85, fontWeight: 700 }}>{cat} Budget</span>
+                      <input
+                        type="number"
+                        min={0}
+                        step="1"
+                        style={inputStyle}
+                        value={budgets[cat] ?? 0}
+                        onChange={(e) => setBudget(cat, e.target.value)}
+                      />
+                    </label>
+                  ))}
+                </div>
+                <p style={{ marginTop: 10, opacity: 0.75 }}>
+                  Budgets save automatically for {monthKey}.
+                </p>
+              </div>
+            )}
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                gap: 10,
+              }}
+            >
+              {categories.map((cat) => {
+                const spent = categoryTotals[cat] ?? 0;
+                const budget = budgets[cat] ?? 0;
+                const pct = budget > 0 ? clamp((spent / budget) * 100, 0, 999) : 0;
+                const remaining = budget - spent;
+                const over = budget > 0 && remaining < 0;
+
+                return (
+                  <div key={cat} style={{ ...panelStyle, padding: 14 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                      <div style={{ fontWeight: 900 }}>{cat}</div>
+                      <div style={{ fontWeight: 900 }}>{money(spent)}</div>
+                    </div>
+
+                    {/* Progress / Budget */}
+                    <div style={{ marginTop: 10 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, opacity: 0.85 }}>
+                        <span>Budget: {budget > 0 ? money(budget) : "—"}</span>
+                        <span>{budget > 0 ? `${Math.round(clamp(pct, 0, 999))}%` : "No budget"}</span>
+                      </div>
+
+                      <div
+                        style={{
+                          height: 8,
+                          borderRadius: 999,
+                          background: "rgba(255,255,255,0.12)",
+                          overflow: "hidden",
+                          marginTop: 6,
+                        }}
+                      >
+                        <div
+                          style={{
+                            height: "100%",
+                            width: `${clamp(pct, 0, 100)}%`,
+                            background: over ? "rgba(255,90,90,0.92)" : "rgba(90,180,255,0.92)",
+                          }}
+                        />
+                      </div>
+
+                      {budget > 0 && (
+                        <div style={{ marginTop: 6, fontSize: 12, opacity: 0.9 }}>
+                          {remaining >= 0
+                            ? `Remaining: ${money(remaining)}`
+                            : `Over by: ${money(Math.abs(remaining))}`}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
-      </div>
 
-      {/* Entries */}
-      <div style={styles.panel}>
-        <div style={styles.sectionTitle}>This Month’s Entries</div>
+        {/* Add expense */}
+        <div style={{ ...panelStyle, marginTop: 14 }}>
+          <h3 style={{ marginTop: 0 }}>{editingId ? "Edit Expense" : "Add Expense"}</h3>
 
-        <div style={styles.table}>
-          <div style={{ ...styles.tr, ...styles.th }}>
-            <div>Date</div>
-            <div>What</div>
-            <div>Location</div>
-            <div>Category</div>
-            <div style={{ textAlign: "right" }}>Amount</div>
-            <div style={{ textAlign: "right" }}>Actions</div>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(3, minmax(180px, 1fr))",
+              gap: 12,
+              alignItems: "end",
+            }}
+          >
+            <label style={labelStyle}>
+              <span style={{ opacity: 0.85, fontWeight: 700 }}>Date</span>
+              <input type="date" style={inputStyle} value={formDate} onChange={(e) => setFormDate(e.target.value)} />
+            </label>
+
+            <label style={labelStyle}>
+              <span style={{ opacity: 0.85, fontWeight: 700 }}>Amount</span>
+              <input
+                type="number"
+                min={0}
+                step="0.01"
+                style={inputStyle}
+                value={formAmount}
+                onChange={(e) => setFormAmount(e.target.value)}
+                placeholder="12.34"
+              />
+            </label>
+
+            <label style={labelStyle}>
+              <span style={{ opacity: 0.85, fontWeight: 700 }}>Category</span>
+              <select
+                style={inputStyle}
+                value={formCategory}
+                onChange={(e) => setFormCategory(e.target.value)}
+              >
+                {categories.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+                {/* If editing an entry whose category no longer exists */}
+                {!categories.includes(formCategory) && (
+                  <option value={formCategory}>{formCategory} (old)</option>
+                )}
+              </select>
+            </label>
           </div>
 
-          {monthEntries.length === 0 ? (
-            <div style={styles.empty}>No entries yet for this month.</div>
+          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+            <label style={labelStyle}>
+              <span style={{ opacity: 0.85, fontWeight: 700 }}>What was it?</span>
+              <input
+                style={inputStyle}
+                value={formWhat}
+                onChange={(e) => setFormWhat(e.target.value)}
+                placeholder="Groceries, protein powder, car wash..."
+              />
+            </label>
+
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
+              {editingId && (
+                <button style={buttonStyle} onClick={cancelEdit}>
+                  Cancel
+                </button>
+              )}
+              <button style={primaryButtonStyle} onClick={addOrUpdateExpense}>
+                {editingId ? "Save" : "Add"}
+              </button>
+            </div>
+
+            <div style={{ fontSize: 12, opacity: 0.75 }}>
+              Tip: Amount must be &gt; 0 and “What was it?” can’t be empty.
+            </div>
+          </div>
+        </div>
+
+        {/* Entries table */}
+        <div style={{ ...panelStyle, marginTop: 14 }}>
+          <h3 style={{ marginTop: 0 }}>This Month’s Entries</h3>
+
+          {entries.length === 0 ? (
+            <p style={{ opacity: 0.75 }}>No entries yet for {monthKey}.</p>
           ) : (
-            monthEntries.map((e) => {
-              const isEditing = editingId === e.id;
-
-              return (
-                <div key={e.id} style={styles.tr}>
-                  {/* Date */}
-                  <div>
-                    {isEditing ? (
-                      <input
-                        type="date"
-                        value={editDraft?.date ?? e.date}
-                        onChange={(ev) =>
-                          setEditDraft((d) => (d ? { ...d, date: ev.target.value } : d))
-                        }
-                        style={styles.inputSmall}
-                      />
-                    ) : (
-                      e.date
-                    )}
-                  </div>
-
-                  {/* What */}
-                  <div style={{ fontWeight: 700 }}>
-                    {isEditing ? (
-                      <input
-                        value={editDraft?.what ?? e.what}
-                        onChange={(ev) =>
-                          setEditDraft((d) => (d ? { ...d, what: ev.target.value } : d))
-                        }
-                        style={styles.inputSmallWide}
-                      />
-                    ) : (
-                      e.what
-                    )}
-                  </div>
-
-                  {/* Location */}
-                  <div style={{ opacity: 0.85 }}>
-                    {isEditing ? (
-                      <input
-                        value={editDraft?.location ?? e.location}
-                        onChange={(ev) =>
-                          setEditDraft((d) => (d ? { ...d, location: ev.target.value } : d))
-                        }
-                        style={styles.inputSmallWide}
-                      />
-                    ) : (
-                      e.location || "—"
-                    )}
-                  </div>
-
-                  {/* Category */}
-                  <div>
-                    {isEditing ? (
-                      <select
-                        value={editDraft?.category ?? e.category}
-                        onChange={(ev) =>
-                          setEditDraft((d) => (d ? { ...d, category: ev.target.value as Category } : d))
-                        }
-                        style={styles.inputSmall}
-                      >
-                        {CATEGORIES.map((c) => (
-                          <option key={c} value={c}>{c}</option>
-                        ))}
-                      </select>
-                    ) : (
-                      <span style={styles.categoryChip}>{e.category}</span>
-                    )}
-                  </div>
-
-                  {/* Amount */}
-                  <div style={{ textAlign: "right", fontVariantNumeric: "tabular-nums", fontWeight: 700 }}>
-                    {isEditing ? (
-                      <input
-                        value={String(editDraft?.amount ?? e.amount)}
-                        onChange={(ev) =>
-                          setEditDraft((d) => (d ? { ...d, amount: ev.target.value as unknown as any } : d))
-                        }
-                        inputMode="decimal"
-                        style={styles.inputSmallAmount}
-                      />
-                    ) : (
-                      formatMoney(e.amount)
-                    )}
-                  </div>
-
-                  {/* Actions */}
-                  <div style={{ textAlign: "right", display: "flex", justifyContent: "flex-end", gap: 8 }}>
-                    {isEditing ? (
-                      <>
-                        <button style={{ ...styles.btn, ...styles.btnPrimarySmall }} onClick={saveEdit}>
-                          Save
-                        </button>
-                        <button style={{ ...styles.btn, ...styles.btnOutlineSmall }} onClick={cancelEdit}>
-                          Cancel
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <button style={{ ...styles.btn, ...styles.btnOutlineSmall }} onClick={() => startEdit(e)}>
-                          Edit
-                        </button>
-                        <button
-                          style={{ ...styles.btn, ...styles.btnDangerSmall }}
-                          onClick={() => deleteEntry(e.id)}
-                        >
-                          Delete
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-              );
-            })
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ textAlign: "left", opacity: 0.85 }}>
+                    <th style={{ padding: "10px 8px" }}>Date</th>
+                    <th style={{ padding: "10px 8px" }}>What</th>
+                    <th style={{ padding: "10px 8px" }}>Category</th>
+                    <th style={{ padding: "10px 8px" }}>Amount</th>
+                    <th style={{ padding: "10px 8px" }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {entries
+                    .slice()
+                    .sort((a, b) => (a.date < b.date ? 1 : -1))
+                    .map((e) => (
+                      <tr key={e.id} style={{ borderTop: "1px solid rgba(255,255,255,0.10)" }}>
+                        <td style={{ padding: "10px 8px", whiteSpace: "nowrap" }}>{e.date}</td>
+                        <td style={{ padding: "10px 8px", fontWeight: 700 }}>{e.what}</td>
+                        <td style={{ padding: "10px 8px" }}>
+                          <span
+                            style={{
+                              display: "inline-block",
+                              padding: "4px 10px",
+                              borderRadius: 999,
+                              border: "1px solid rgba(255,255,255,0.18)",
+                              background: "rgba(255,255,255,0.06)",
+                              fontSize: 12,
+                              fontWeight: 800,
+                            }}
+                          >
+                            {e.category}
+                          </span>
+                        </td>
+                        <td style={{ padding: "10px 8px", fontWeight: 900 }}>{money(e.amount)}</td>
+                        <td style={{ padding: "10px 8px" }}>
+                          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                            <button style={buttonStyle} onClick={() => startEdit(e)}>
+                              Edit
+                            </button>
+                            <button style={dangerButtonStyle} onClick={() => deleteEntry(e.id)}>
+                              Delete
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
 
-        {editingId && (
-          <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-            Editing tip: Amount must be {">"} 0, and “What” can’t be empty.
-          </div>
-        )}
+        <p style={{ marginTop: 16, opacity: 0.65, fontSize: 12 }}>
+          Note: Everything saves locally on this device/browser.
+        </p>
       </div>
     </div>
   );
 }
-
-function Field({ label, children, full }: { label: string; children: React.ReactNode; full?: boolean }) {
-  return (
-    <div style={{ ...styles.field, ...(full ? styles.fieldFull : null) }}>
-      <div style={styles.label}>{label}</div>
-      {children}
-    </div>
-  );
-}
-
-function MiniCard({ title, value }: { title: string; value: string }) {
-  return (
-    <div style={styles.card}>
-      <div style={styles.cardTitle}>{title}</div>
-      <div style={styles.cardValue}>{value}</div>
-    </div>
-  );
-}
-
-const styles: Record<string, React.CSSProperties> = {
-  page: {
-    maxWidth: 1100,
-    margin: "0 auto",
-    padding: 24,
-    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-    color: "#e9eef7",
-  },
-  headerRow: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 },
-  title: { margin: 0, fontSize: 44, fontWeight: 900, letterSpacing: -1 },
-  subtitle: { marginTop: 6, opacity: 0.8, fontSize: 13 },
-
-  panel: {
-    marginTop: 14,
-    padding: 16,
-    borderRadius: 14,
-    background: "rgba(30, 49, 86, 0.35)",
-    border: "1px solid rgba(255,255,255,0.10)",
-    boxShadow: "0 10px 30px rgba(0,0,0,0.15)",
-  },
-
-  panelHeaderRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 },
-  monthRow: { display: "flex", alignItems: "center", gap: 12, marginTop: 6 },
-  sectionLabel: { fontSize: 12, opacity: 0.8 },
-  sectionTitle: { fontSize: 18, fontWeight: 900, marginBottom: 12 },
-
-  cards: {
-    marginTop: 14,
-    display: "grid",
-    gap: 12,
-    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-  },
-  card: {
-    padding: 12,
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(0,0,0,0.12)",
-  },
-  cardTitle: { fontSize: 12, opacity: 0.75 },
-  cardValue: { marginTop: 6, fontSize: 18, fontWeight: 900 },
-
-  categoryGrid: {
-    marginTop: 10,
-    display: "grid",
-    gap: 10,
-    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-  },
-  categoryPill: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    padding: "10px 12px",
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(0,0,0,0.10)",
-  },
-
-  addGrid: {
-    display: "grid",
-    gap: 12,
-    gridTemplateColumns: "repeat(12, minmax(0, 1fr))",
-    alignItems: "end",
-  },
-  field: { display: "flex", flexDirection: "column", gap: 6, gridColumn: "span 3" },
-  fieldFull: { gridColumn: "1 / -1" },
-  label: { fontSize: 12, opacity: 0.75 },
-
-  addActionsRow: {
-    gridColumn: "1 / -1",
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: 12,
-    marginTop: 2,
-  },
-  tip: { fontSize: 12, opacity: 0.75 },
-
-  input: {
-    padding: "10px 12px",
-    borderRadius: 10,
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "rgba(0,0,0,0.18)",
-    color: "#e9eef7",
-    outline: "none",
-  },
-
-  inputSmall: {
-    padding: "8px 10px",
-    borderRadius: 10,
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "rgba(0,0,0,0.18)",
-    color: "#e9eef7",
-    outline: "none",
-    width: "100%",
-  },
-  inputSmallWide: {
-    padding: "8px 10px",
-    borderRadius: 10,
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "rgba(0,0,0,0.18)",
-    color: "#e9eef7",
-    outline: "none",
-    width: "100%",
-    minWidth: 160,
-  },
-  inputSmallAmount: {
-    padding: "8px 10px",
-    borderRadius: 10,
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "rgba(0,0,0,0.18)",
-    color: "#e9eef7",
-    outline: "none",
-    width: 110,
-    textAlign: "right",
-  },
-
-  table: {
-    borderRadius: 12,
-    overflow: "hidden",
-    border: "1px solid rgba(255,255,255,0.12)",
-  },
-  tr: {
-    display: "grid",
-    gridTemplateColumns: "140px 1.2fr 1fr 160px 140px 210px",
-    gap: 12,
-    padding: 12,
-    alignItems: "center",
-    background: "rgba(0,0,0,0.10)",
-    borderTop: "1px solid rgba(255,255,255,0.08)",
-  },
-  th: {
-    background: "rgba(0,0,0,0.18)",
-    fontSize: 12,
-    fontWeight: 800,
-    opacity: 0.85,
-    borderTop: "none",
-  },
-  empty: { padding: 14, opacity: 0.75 },
-
-  categoryChip: {
-    display: "inline-block",
-    padding: "6px 10px",
-    borderRadius: 999,
-    border: "1px solid rgba(255,255,255,0.18)",
-    background: "rgba(0,0,0,0.12)",
-    fontSize: 12,
-    fontWeight: 800,
-  },
-
-  btn: {
-    padding: "10px 12px",
-    borderRadius: 10,
-    border: "1px solid rgba(255,255,255,0.18)",
-    background: "rgba(0,0,0,0.12)",
-    color: "#e9eef7",
-    cursor: "pointer",
-    fontWeight: 800,
-  },
-  btnPrimary: { background: "#2f6bff", border: "1px solid rgba(255,255,255,0.18)" },
-  btnOutline: { background: "transparent" },
-  btnDangerOutline: { background: "transparent", border: "1px solid rgba(255, 92, 92, 0.6)" },
-
-  btnPrimarySmall: { padding: "8px 10px", background: "#2f6bff" },
-  btnOutlineSmall: { padding: "8px 10px", background: "transparent" },
-  btnDangerSmall: { padding: "8px 10px", background: "rgba(255, 92, 92, 0.15)", border: "1px solid rgba(255, 92, 92, 0.6)" },
-};
-
-// Responsive tweak: stack Add Expense fields nicely
-// (inline styles can't use media queries easily—so we keep it simple and rely on grid wrapping)
-// If you want perfect responsive behavior, we can move styling into CSS next.
